@@ -1461,7 +1461,13 @@ function Step-ShellCompletion {
     # ---- PowerShell (Windows) ----
     Write-Log "Configuration PowerShell..." -Level "INFO"
 
-    $psProfileDir = Split-Path $PROFILE -Parent
+    # $PROFILE peut etre vide si lance avec -NoProfile ou dans certains contextes
+    $psProfile = $PROFILE
+    if (-not $psProfile) {
+        $psProfile = "$env:USERPROFILE\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1"
+    }
+
+    $psProfileDir = Split-Path $psProfile -Parent
     if (-not (Test-Path $psProfileDir)) {
         New-Item -ItemType Directory -Path $psProfileDir -Force | Out-Null
     }
@@ -1486,21 +1492,21 @@ if (Get-Command claude -ErrorAction SilentlyContinue) {
 '@
 
     # Verifier si deja ajoute
-    if (Test-Path $PROFILE) {
-        $profileContent = Get-Content $PROFILE -Raw -ErrorAction SilentlyContinue
+    if (Test-Path $psProfile) {
+        $profileContent = Get-Content $psProfile -Raw -ErrorAction SilentlyContinue
         if ($profileContent -match "Claude Code Autocompletion") {
             Write-Log "Autocompletion PowerShell deja configuree" -Level "SUCCESS"
         }
         else {
             Invoke-WithDryRun "Add Claude completion to PowerShell profile" {
-                Add-Content -Path $PROFILE -Value $completionBlock -Encoding UTF8
+                Add-Content -Path $psProfile -Value $completionBlock -Encoding UTF8
             }
-            Write-Log "Autocompletion PowerShell ajoutee a $PROFILE" -Level "SUCCESS"
+            Write-Log "Autocompletion PowerShell ajoutee a $psProfile" -Level "SUCCESS"
         }
     }
     else {
         Invoke-WithDryRun "Create PowerShell profile with Claude completion" {
-            Set-Content -Path $PROFILE -Value $completionBlock -Encoding UTF8
+            Set-Content -Path $psProfile -Value $completionBlock -Encoding UTF8
         }
         Write-Log "Profil PowerShell cree avec autocompletion Claude" -Level "SUCCESS"
     }
