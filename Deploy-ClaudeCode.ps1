@@ -140,6 +140,36 @@ param(
 )
 
 # ============================================================================
+# AUTO-ELEVATION UAC (relance en admin si necessaire)
+# ============================================================================
+
+if (-not $DryRun) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host "[!] Elevation requise — lancement en tant qu'administrateur..." -ForegroundColor Yellow
+        # Reconstruire la ligne de commande avec tous les parametres
+        $argList = @("-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+        if ($Profile)            { $argList += "-Profile"; $argList += "`"$Profile`"" }
+        if ($PluginSourcePath)   { $argList += "-PluginSourcePath"; $argList += "`"$PluginSourcePath`"" }
+        if ($ManagedSettingsPath){ $argList += "-ManagedSettingsPath"; $argList += "`"$ManagedSettingsPath`"" }
+        if ($ProxyUrl)           { $argList += "-ProxyUrl"; $argList += "`"$ProxyUrl`"" }
+        if ($GithubToken)        { $argList += "-GithubToken"; $argList += "`"$GithubToken`"" }
+        if ($WSLUser)            { $argList += "-WSLUser"; $argList += "`"$WSLUser`"" }
+        if ($SkipRebootCheck)    { $argList += "-SkipRebootCheck" }
+        if ($ForceReinstall)     { $argList += "-ForceReinstall" }
+        if ($AdminOnly)          { $argList += "-AdminOnly" }
+        try {
+            Start-Process powershell.exe -ArgumentList $argList -Verb RunAs -Wait
+        }
+        catch {
+            Write-Host "[X] Elevation refusee ou echouee. Relancez manuellement en admin." -ForegroundColor Red
+        }
+        exit
+    }
+}
+
+# ============================================================================
 # CONFIGURATION - Modifier ces valeurs selon votre environnement
 # ============================================================================
 
@@ -516,13 +546,20 @@ function Step-Prerequisites {
         }
     }
 
-    # Verifier les droits admin
+    # Verifier les droits admin (en DryRun, on avertit mais on continue)
     if (-not (Test-AdminPrivileges)) {
-        Write-Log "Ce script necessite des droits administrateur. Relancez en tant qu'admin." -Level "ERROR"
-        Write-Log "Astuce: clic droit sur PowerShell > Executer en tant qu'administrateur" -Level "INFO"
-        return $false
+        if ($DryRun) {
+            Write-Log "Pas de droits admin (normal en DryRun — l'auto-elevation se fait en mode reel)" -Level "WARN"
+        }
+        else {
+            Write-Log "Ce script necessite des droits administrateur." -Level "ERROR"
+            Write-Log "L'auto-elevation aurait du se declencher. Relancez manuellement en admin." -Level "INFO"
+            return $false
+        }
     }
-    Write-Log "Droits administrateur confirmes" -Level "SUCCESS"
+    else {
+        Write-Log "Droits administrateur confirmes" -Level "SUCCESS"
+    }
 
     # Verifier la version Windows
     $osVersion = [System.Environment]::OSVersion.Version
@@ -628,8 +665,15 @@ function Step-WSL2Setup {
     $needsReboot = $false
 
     # Verifier Virtual Machine Platform (requis pour Cowork aussi)
-    $vmpFeature = Get-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform" -ErrorAction SilentlyContinue
-    if ($vmpFeature.State -ne "Enabled") {
+    # Note: Get-WindowsOptionalFeature necessite elevation — en DryRun on simule
+    $vmpFeature = $null
+    $wslFeature = $null
+    if (Test-AdminPrivileges) {
+        $vmpFeature = Get-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform" -ErrorAction SilentlyContinue
+        $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Windows-Subsystem-Linux" -ErrorAction SilentlyContinue
+    }
+
+    if (-not $vmpFeature -or $vmpFeature.State -ne "Enabled") {
         Write-Log "Activation de Virtual Machine Platform..." -Level "INFO"
         if ($DryRun) {
             Write-Log "[DRY RUN] Virtual Machine Platform SERAIT active (redemarrage serait requis)" -Level "WARN"
@@ -646,9 +690,7 @@ function Step-WSL2Setup {
         Write-Log "Virtual Machine Platform deja active" -Level "SUCCESS"
     }
 
-    # Verifier WSL
-    $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Windows-Subsystem-Linux" -ErrorAction SilentlyContinue
-    if ($wslFeature.State -ne "Enabled") {
+    if (-not $wslFeature -or $wslFeature.State -ne "Enabled") {
         Write-Log "Activation de Windows Subsystem for Linux..." -Level "INFO"
         if ($DryRun) {
             Write-Log "[DRY RUN] WSL SERAIT active (redemarrage serait requis)" -Level "WARN"
