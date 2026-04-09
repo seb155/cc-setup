@@ -14,8 +14,16 @@
       6. Configuration centralisee (managed-settings.json)
       7. Plugin depuis partage reseau ou chemin local
       8. Autocompletion shell (PowerShell + Bash/Zsh dans WSL2)
-      9. Tache planifiee de mise a jour automatique
-     10. Validation finale + rapport JSON
+      9. CShip status line (binaire + config + settings.json, Win + WSL2)
+     10. Tache planifiee de mise a jour automatique
+     11. Validation finale + rapport JSON
+
+    Fonctionnalites v4.0 :
+      - Menu interactif avec 5 profils (Standard, Developer, Admin, Custom, DryRun)
+      - Plugin ATLAS marketplace (Developer profile, GITHUB_TOKEN)
+      - CShip status line (binaire + config + settings.json, Win + WSL2)
+      - Smart WSLUser default (Windows username)
+      - Prochaines etapes contextuelles selon le profil
 
     Fonctionnalites v2.0 :
       - Resume automatique apres reboot (RunOnce registry)
@@ -25,8 +33,20 @@
       - Support proxy HTTP/HTTPS (-ProxyUrl)
       - Pre-flight inventory JSON
 
+.PARAMETER Profile
+    Profil de deploiement: Standard, Developer, Admin, Custom.
+    Standard = Desktop + Cowork + Plugin GMS (utilisateurs normaux).
+    Developer = Standard + WSL2 + VS Code + CLI + ATLAS + CShip (codeurs).
+    Admin = managed-settings + WSL features + scheduled task (IT).
+    Custom = selection interactive des etapes.
+    Si omis, le menu interactif s'affiche.
+
 .PARAMETER PluginSourcePath
-    Chemin UNC ou local vers le dossier du plugin (ex: \\server\share\genie-gms-assistant)
+    Chemin UNC ou local vers le dossier du plugin GMS (ex: \\server\share\genie-gms-assistant)
+
+.PARAMETER GithubToken
+    Token GitHub pour le plugin ATLAS (repo prive). Utilise par le profil Developer.
+    Si omis, lit $env:GITHUB_TOKEN. Si absent, demande interactivement.
 
 .PARAMETER ManagedSettingsPath
     Chemin optionnel vers un managed-settings.json personnalise a deployer
@@ -52,8 +72,8 @@
 
 .NOTES
     Auteur  : Sebastien Gagnon - G Mining Services (CAGM)
-    Version : 3.0.0
-    Date    : 2026-04-08
+    Version : 4.0.0
+    Date    : 2026-04-09
     Licence : Usage interne CAGM uniquement
 
     Prerequis pour l'execution :
@@ -63,21 +83,34 @@
       - Acces reseau au partage du plugin (si applicable)
 
     Usage :
-      # Deploiement complet
-      .\Deploy-ClaudeCode.ps1 -PluginSourcePath "\\srv-files\Tools\genie-gms-assistant"
+      # Menu interactif (recommande)
+      .\Deploy-ClaudeCode.ps1
 
-      # Mode simulation (DryRun complet sans arreter)
+      # Utilisateur standard avec plugin GMS
+      .\Deploy-ClaudeCode.ps1 -Profile Standard -PluginSourcePath "\\srv-files\Tools\genie-gms-assistant"
+
+      # Developpeur avec ATLAS plugin
+      .\Deploy-ClaudeCode.ps1 -Profile Developer -GithubToken "ghp_xxx"
+
+      # IT Admin: preparer le poste silencieusement
+      .\Deploy-ClaudeCode.ps1 -Profile Admin -ManagedSettingsPath "C:\Deploy\managed-settings.json"
+
+      # Simulation sans rien modifier
       .\Deploy-ClaudeCode.ps1 -DryRun
 
       # Avec proxy corporatif
-      .\Deploy-ClaudeCode.ps1 -ProxyUrl "http://proxy.gmining.com:8080" -PluginSourcePath "C:\Temp\genie-gms-assistant"
+      .\Deploy-ClaudeCode.ps1 -Profile Standard -ProxyUrl "http://proxy.gmining.com:8080"
 
-      # Forcer la reinstallation (binaires seulement, pas les settings)
-      .\Deploy-ClaudeCode.ps1 -ForceReinstall -PluginSourcePath "C:\Temp\genie-gms-assistant"
+      # Forcer la reinstallation
+      .\Deploy-ClaudeCode.ps1 -Profile Developer -ForceReinstall -GithubToken "ghp_xxx"
 #>
 
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Standard", "Developer", "Admin", "Custom", "")]
+    [string]$Profile = "",
+
     [Parameter(Mandatory = $false)]
     [string]$PluginSourcePath = "",
 
@@ -86,6 +119,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [string]$ProxyUrl = "",
+
+    [Parameter(Mandatory = $false)]
+    [string]$GithubToken = "",
 
     [Parameter(Mandatory = $false)]
     [switch]$SkipRebootCheck,
@@ -97,7 +133,7 @@ param(
     [switch]$AdminOnly,
 
     [Parameter(Mandatory = $false)]
-    [string]$WSLUser = "claude",
+    [string]$WSLUser = "",
 
     [Parameter(Mandatory = $false)]
     [switch]$DryRun
@@ -132,6 +168,137 @@ $Config = @{
     UpdateTaskName          = "ClaudeCode-AutoUpdate"
     UpdateSchedule          = "Weekly"                      # "Daily" ou "Weekly"
     UpdateTime              = "06:00"                       # Heure locale
+
+    # ATLAS Plugin (Developer profile)
+    ATLASPluginRepo         = "seb155/atlas-plugin"
+    ATLASPluginName         = "atlas-admin"
+    ATLASMarketplace        = "atlas-admin-marketplace"
+}
+
+# Smart WSLUser default: Windows username, lowered, sanitized
+if (-not $WSLUser) {
+    $WSLUser = ($env:USERNAME -replace '[^a-zA-Z0-9]', '').ToLower()
+    if (-not $WSLUser) { $WSLUser = "claude" }
+}
+
+# GITHUB_TOKEN: parameter > env var
+if (-not $GithubToken -and $env:GITHUB_TOKEN) {
+    $GithubToken = $env:GITHUB_TOKEN
+}
+
+# Legacy: -AdminOnly maps to -Profile Admin
+if ($AdminOnly -and -not $Profile) {
+    $Profile = "Admin"
+}
+
+# ============================================================================
+# MENU INTERACTIF
+# ============================================================================
+
+function Show-DeploymentMenu {
+    param([string]$PreSelected = "")
+
+    $menuItems = @(
+        @{ Key = "1"; Profile = "Standard";  Label = "Utilisateur Standard";   Desc = "Claude Desktop + Cowork + Plugin GMS"; Detail = "Pour ingenieurs, gestionnaires, administratifs" }
+        @{ Key = "2"; Profile = "Developer"; Label = "Developpeur";            Desc = "Standard + WSL2 + VS Code + CLI + ATLAS + CShip"; Detail = "Pour I&C, EL, developpeurs, power users" }
+        @{ Key = "3"; Profile = "Admin";     Label = "IT Admin (silencieux)";  Desc = "managed-settings + WSL features + scheduled task"; Detail = "Prepare le poste, user-space execute au login" }
+        @{ Key = "4"; Profile = "Custom";    Label = "Custom (choisir)";       Desc = "Menu interactif avec selection des etapes"; Detail = "Pour les cas speciaux" }
+        @{ Key = "5"; Profile = "DryRun";    Label = "Dry Run (simulation)";   Desc = "Verifie l'etat sans rien modifier"; Detail = "Securitaire, aucune modification" }
+    )
+
+    Write-Host ""
+    Write-Host "  =================================================================" -ForegroundColor Cyan
+    Write-Host "     DEPLOIEMENT CLAUDE CODE - G Mining Services (CAGM)" -ForegroundColor Cyan
+    Write-Host "  =================================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    foreach ($item in $menuItems) {
+        $marker = "   "
+        $color = "White"
+        if ($PreSelected -eq $item.Profile -or ($PreSelected -eq "DryRun" -and $item.Key -eq "5")) {
+            $marker = " > "
+            $color = "Green"
+        }
+        Write-Host "${marker}[$($item.Key)] $($item.Label)" -ForegroundColor $color
+        Write-Host "       $($item.Desc)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    Write-Host "  -----------------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "   Poste: $env:COMPUTERNAME | User: $env:USERNAME" -ForegroundColor DarkGray
+    Write-Host "  =================================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Si pre-selectionne, demander confirmation
+    if ($PreSelected) {
+        $preLabel = ($menuItems | Where-Object { $_.Profile -eq $PreSelected -or ($PreSelected -eq "DryRun" -and $_.Key -eq "5") } | Select-Object -First 1).Label
+        Write-Host "  Profile pre-selectionne: $preLabel" -ForegroundColor Green
+        $confirm = Read-Host "  Appuyez sur Entree pour confirmer ou tapez un numero [1-5]"
+        if (-not $confirm) {
+            if ($PreSelected -eq "DryRun") { return @{ Profile = "Standard"; DryRun = $true } }
+            return @{ Profile = $PreSelected; DryRun = $false }
+        }
+        $choice = $confirm.Trim()
+    }
+    else {
+        $choice = Read-Host "  Choisissez un profil [1-5]"
+    }
+
+    $selected = $menuItems | Where-Object { $_.Key -eq $choice } | Select-Object -First 1
+    if (-not $selected) {
+        Write-Host "  Choix invalide. Utilisation du profil Standard." -ForegroundColor Yellow
+        return @{ Profile = "Standard"; DryRun = $false }
+    }
+
+    if ($selected.Profile -eq "DryRun") {
+        return @{ Profile = "Standard"; DryRun = $true }
+    }
+
+    return @{ Profile = $selected.Profile; DryRun = $false }
+}
+
+function Show-CustomStepMenu {
+    $allSteps = @(
+        @{ Num = 0;  Label = "Pre-flight (verifications)";              Default = $true }
+        @{ Num = 1;  Label = "WSL2 (Virtual Machine Platform + Ubuntu)"; Default = $false }
+        @{ Num = 2;  Label = "Claude Code CLI (WSL2)";                  Default = $false }
+        @{ Num = 3;  Label = "Claude Code CLI (Windows)";               Default = $false }
+        @{ Num = 4;  Label = "Claude Desktop / Cowork (MSIX)";          Default = $true }
+        @{ Num = 5;  Label = "VS Code + extensions + raccourcis";       Default = $false }
+        @{ Num = 6;  Label = "Configuration centralisee (managed)";     Default = $true }
+        @{ Num = 7;  Label = "Plugin GMS (copie locale)";               Default = $false }
+        @{ Num = 8;  Label = "Plugin ATLAS (marketplace GitHub)";       Default = $false }
+        @{ Num = 9;  Label = "Autocompletion shell";                    Default = $false }
+        @{ Num = 10; Label = "CShip Status Line";                       Default = $false }
+        @{ Num = 11; Label = "Mise a jour automatique (scheduled task)"; Default = $false }
+        @{ Num = 12; Label = "Validation finale";                       Default = $true }
+        @{ Num = 13; Label = "Windows Terminal (profil ATLAS + raccourci)"; Default = $false }
+    )
+
+    Write-Host ""
+    Write-Host "  Selectionnez les etapes a executer:" -ForegroundColor Cyan
+    Write-Host "  (tapez les numeros separes par des virgules, ex: 0,1,2,4,6,12)" -ForegroundColor DarkGray
+    Write-Host ""
+
+    foreach ($s in $allSteps) {
+        $mark = if ($s.Default) { "[x]" } else { "[ ]" }
+        Write-Host "   $mark $($s.Num). $($s.Label)" -ForegroundColor $(if ($s.Default) { "Green" } else { "White" })
+    }
+
+    Write-Host ""
+    $input = Read-Host "  Etapes"
+    if (-not $input) {
+        return ($allSteps | Where-Object { $_.Default } | ForEach-Object { $_.Num })
+    }
+
+    return ($input -split ',' | ForEach-Object { [int]$_.Trim() })
+}
+
+# Mapping profil -> etapes
+$ProfileStepMap = @{
+    Standard  = @(0, 1, 4, 6, 7, 9, 11, 12)         # VMP + Desktop + settings + GMS + shell + updates + validation
+    Developer = @(0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13)  # Full + ATLAS + CShip + Windows Terminal
+    Admin     = @(0, 1, 6, 11, 12)                    # WSL features + settings + updates + validation
 }
 
 # ============================================================================
@@ -1168,6 +1335,120 @@ function Step-DeployPlugin {
 }
 
 # ============================================================================
+# ETAPE 7b : PLUGIN ATLAS (Marketplace GitHub — Developer profile)
+# ============================================================================
+
+function Step-PluginATLAS {
+    Write-Log "" -Level "STEP"
+    Write-Log "=" * 70 -Level "STEP"
+    Write-Log "ETAPE 7b : Installation du plugin ATLAS (marketplace)" -Level "STEP"
+    Write-Log "=" * 70 -Level "STEP"
+
+    # Verifier GITHUB_TOKEN
+    if (-not $GithubToken) {
+        Write-Log "GITHUB_TOKEN requis pour le plugin ATLAS (repo prive)" -Level "WARN"
+        Write-Log "Options:" -Level "INFO"
+        Write-Log "  1. Definir: `$env:GITHUB_TOKEN = 'ghp_xxx'" -Level "INFO"
+        Write-Log "  2. Passer: -GithubToken 'ghp_xxx'" -Level "INFO"
+        Write-Log "  3. Creer un token: github.com/settings/tokens" -Level "INFO"
+
+        if (-not $DryRun) {
+            $tokenInput = Read-Host "  Entrez votre GITHUB_TOKEN (ou Entree pour ignorer)"
+            if ($tokenInput) {
+                $GithubToken = $tokenInput
+            }
+            else {
+                Write-Log "Plugin ATLAS ignore (pas de token). Installez manuellement plus tard." -Level "WARN"
+                Write-Log "  Dans Claude Code: /plugin marketplace add $($Config.ATLASPluginRepo)" -Level "INFO"
+                return $true
+            }
+        }
+        else {
+            Write-Log "[DRY RUN] Token serait demande interactivement" -Level "WARN"
+            return $true
+        }
+    }
+
+    Write-Log "GITHUB_TOKEN disponible. Installation du plugin ATLAS..." -Level "SUCCESS"
+
+    # ---- WSL2: marketplace add + install ----
+    Write-Log "Enregistrement du marketplace ATLAS dans WSL2..." -Level "INFO"
+    Invoke-WithDryRun "Register ATLAS marketplace in WSL2" {
+        $cmd = @"
+export GITHUB_TOKEN='$GithubToken'
+export PATH="\$HOME/.local/bin:\$PATH"
+
+# Enregistrer le marketplace
+claude plugin marketplace add $($Config.ATLASPluginRepo) 2>&1 || echo 'Marketplace may already be registered'
+
+# Installer le plugin admin (monolith)
+claude plugin install $($Config.ATLASPluginName)@$($Config.ATLASMarketplace) 2>&1 || echo 'Plugin install issue'
+
+echo 'ATLAS plugin setup complete'
+"@
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        Set-Content -Path $tempFile -Value $cmd -Encoding UTF8 -NoNewline
+        $wslTempPath = ($tempFile -replace '\\', '/' -replace '^(\w):', '/mnt/$1'.ToLower())
+        wsl -d $Config.WSLDistro -- bash $wslTempPath
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+    Write-Log "Plugin ATLAS enregistre dans WSL2" -Level "SUCCESS"
+
+    # ---- Windows: settings.json + GITHUB_TOKEN ----
+    Write-Log "Configuration du GITHUB_TOKEN dans settings.json..." -Level "INFO"
+    $userSettingsPath = Join-Path $Config.UserSettingsDir "settings.json"
+    Invoke-WithDryRun "Add GITHUB_TOKEN to user settings" {
+        if (Test-Path $userSettingsPath) {
+            try {
+                $settings = Get-Content $userSettingsPath -Raw | ConvertFrom-Json
+                if (-not $settings.env) {
+                    $settings | Add-Member -NotePropertyName "env" -NotePropertyValue @{} -Force
+                }
+                # Ajouter GITHUB_TOKEN dans env si absent
+                if (-not $settings.env.GITHUB_TOKEN) {
+                    $envObj = @{}
+                    $settings.env.PSObject.Properties | ForEach-Object { $envObj[$_.Name] = $_.Value }
+                    $envObj["GITHUB_TOKEN"] = $GithubToken
+                    $settings.env = $envObj
+                    $settings | ConvertTo-Json -Depth 10 | Set-Content $userSettingsPath -Encoding UTF8
+                    Write-Log "GITHUB_TOKEN ajoute a settings.json" -Level "SUCCESS"
+                }
+                else {
+                    Write-Log "GITHUB_TOKEN deja present dans settings.json" -Level "SUCCESS"
+                }
+            }
+            catch {
+                Write-Log "Impossible de modifier settings.json: $_" -Level "WARN"
+            }
+        }
+    }
+
+    # ---- Rappel: installer aussi dans Windows CC si dispo ----
+    $claudeWinExe = "$env:USERPROFILE\.local\bin\claude.exe"
+    if (Test-Path $claudeWinExe) {
+        Write-Log "Installation du plugin ATLAS sur Windows CC..." -Level "INFO"
+        Invoke-WithDryRun "Register ATLAS marketplace on Windows CC" {
+            $env:GITHUB_TOKEN = $GithubToken
+            try {
+                & $claudeWinExe plugin marketplace add $Config.ATLASPluginRepo 2>$null
+                & $claudeWinExe plugin install "$($Config.ATLASPluginName)@$($Config.ATLASMarketplace)" 2>$null
+                Write-Log "Plugin ATLAS installe sur Windows CC" -Level "SUCCESS"
+            }
+            catch {
+                Write-Log "Installation Windows CC echouee (non-critique): $_" -Level "WARN"
+            }
+        }
+    }
+
+    Write-Log "" -Level "INFO"
+    Write-Log "Plugin ATLAS installe! Au prochain demarrage de Claude Code:" -Level "SUCCESS"
+    Write-Log "  Banner: 🏛️ ATLAS | ... v4.x admin" -Level "INFO"
+    Write-Log "  Skills: /atlas doctor, /atlas setup, /atlas help" -Level "INFO"
+
+    return $true
+}
+
+# ============================================================================
 # ETAPE 8 : AUTOCOMPLETION SHELL
 # ============================================================================
 
@@ -1276,13 +1557,385 @@ fi
 }
 
 # ============================================================================
-# ETAPE 9 : MISE A JOUR AUTOMATIQUE (tache planifiee)
+# ETAPE 9b : WINDOWS TERMINAL (profil ATLAS + raccourci desktop)
+# ============================================================================
+
+function Step-WindowsTerminal {
+    Write-Log "" -Level "STEP"
+    Write-Log "=" * 70 -Level "STEP"
+    Write-Log "ETAPE 9b : Configuration Windows Terminal + raccourci ATLAS" -Level "STEP"
+    Write-Log "=" * 70 -Level "STEP"
+
+    # Trouver le settings.json de Windows Terminal
+    $wtSettingsDir = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter "Microsoft.WindowsTerminal_*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $wtSettingsDir) {
+        Write-Log "Windows Terminal non installe — etape ignoree" -Level "WARN"
+        Write-Log "Installez-le: winget install Microsoft.WindowsTerminal" -Level "INFO"
+        return $true
+    }
+
+    $wtSettingsFile = Join-Path $wtSettingsDir.FullName "LocalState\settings.json"
+    if (-not (Test-Path $wtSettingsFile)) {
+        Write-Log "Fichier settings.json Windows Terminal introuvable — etape ignoree" -Level "WARN"
+        return $true
+    }
+
+    Write-Log "Windows Terminal trouve: $wtSettingsFile" -Level "SUCCESS"
+
+    # ---- Telecharger l'icone Claude ----
+    $iconPath = Join-Path $env:USERPROFILE ".claude\claude-code.ico"
+    if (-not (Test-Path $iconPath)) {
+        Invoke-WithDryRun "Download Claude icon" {
+            try {
+                Invoke-WebRequest -Uri "https://claude.ai/favicon.ico" -OutFile $iconPath -UseBasicParsing
+                Write-Log "Icone telechargee: $iconPath" -Level "SUCCESS"
+            }
+            catch {
+                Write-Log "Impossible de telecharger l'icone (non-critique): $_" -Level "WARN"
+            }
+        }
+    }
+    else {
+        Write-Log "Icone deja presente: $iconPath" -Level "SUCCESS"
+    }
+
+    # ---- Ajouter le profil ATLAS ----
+    $atlasGuid = "{c0dec1a0-de00-4000-a000-c0dec0de0001}"
+
+    try {
+        $wtSettings = Get-Content $wtSettingsFile -Raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Log "Impossible de parser le settings.json Windows Terminal: $_" -Level "WARN"
+        return $true
+    }
+
+    # Verifier si le profil ATLAS existe deja
+    $existingAtlas = $wtSettings.profiles.list | Where-Object { $_.guid -eq $atlasGuid -or $_.name -eq "ATLAS" }
+
+    if ($existingAtlas -and -not $ForceReinstall) {
+        Write-Log "Profil ATLAS deja present dans Windows Terminal" -Level "SUCCESS"
+    }
+    else {
+        Write-Log "Ajout du profil ATLAS a Windows Terminal..." -Level "INFO"
+        Invoke-WithDryRun "Add ATLAS profile to Windows Terminal" {
+            $atlasProfile = [PSCustomObject]@{
+                commandline      = "wsl.exe -d $($Config.WSLDistro) --cd ~ -- bash -lc claude"
+                font             = @{ face = "Cascadia Code"; size = 13 }
+                guid             = $atlasGuid
+                hidden           = $false
+                icon             = $iconPath.Replace('\', '\\')
+                name             = "ATLAS"
+                startingDirectory = "~"
+                tabTitle         = "ATLAS - Claude Code"
+            }
+
+            # Inserer en premiere position
+            $profileList = @($atlasProfile) + @($wtSettings.profiles.list | Where-Object { $_.guid -ne $atlasGuid -and $_.name -ne "ATLAS" })
+            $wtSettings.profiles.list = $profileList
+
+            $wtSettings | ConvertTo-Json -Depth 10 | Set-Content $wtSettingsFile -Encoding UTF8
+            Write-Log "Profil ATLAS ajoute a Windows Terminal" -Level "SUCCESS"
+        }
+    }
+
+    # ---- Raccourci Desktop ATLAS ----
+    $desktopPath = [Environment]::GetFolderPath("Desktop")
+    $atlasShortcut = Join-Path $desktopPath "ATLAS.lnk"
+
+    if (-not (Test-Path $atlasShortcut)) {
+        Invoke-WithDryRun "Create ATLAS desktop shortcut" {
+            $wtExe = Get-Command wt.exe -ErrorAction SilentlyContinue
+            if ($wtExe) {
+                $shell = New-Object -ComObject WScript.Shell
+                $shortcut = $shell.CreateShortcut($atlasShortcut)
+                $shortcut.TargetPath = "wt.exe"
+                $shortcut.Arguments = '-p "ATLAS"'
+                $shortcut.Description = "ATLAS - Claude Code dans WSL2 (Windows Terminal)"
+                if (Test-Path $iconPath) {
+                    $shortcut.IconLocation = $iconPath
+                }
+                $shortcut.WorkingDirectory = $env:USERPROFILE
+                $shortcut.Save()
+                Write-Log "Raccourci Desktop cree: ATLAS.lnk" -Level "SUCCESS"
+            }
+            else {
+                Write-Log "wt.exe introuvable — raccourci non cree" -Level "WARN"
+            }
+        }
+    }
+    else {
+        Write-Log "Raccourci ATLAS.lnk deja present sur le bureau" -Level "SUCCESS"
+    }
+
+    return $true
+}
+
+# ============================================================================
+# ETAPE 10 : CSHIP STATUS LINE
+# ============================================================================
+
+function Step-CShipStatusLine {
+    Write-Log "" -Level "STEP"
+    Write-Log "=" * 70 -Level "STEP"
+    Write-Log "ETAPE 9 : Installation de CShip (status line Claude Code)" -Level "STEP"
+    Write-Log "=" * 70 -Level "STEP"
+
+    # CShip est un binaire Rust qui affiche une status line enrichie dans Claude Code :
+    # Row 1: modele + git branch/status + session
+    # Row 2: barre de progression contexte + lignes ajoutees/supprimees + rate limits
+    # Row 3: alertes conditionnelles (contexte >75%, CI fail, etc.)
+
+    # ---- Windows (PowerShell installer — pre-compiled binary) ----
+    Write-Log "Installation de CShip sur Windows..." -Level "INFO"
+
+    $cshipWinPath = "$env:USERPROFILE\.local\bin\cship.exe"
+    $cshipInstalled = Test-Path $cshipWinPath
+
+    if ($cshipInstalled -and -not $ForceReinstall) {
+        Write-Log "CShip deja installe: $cshipWinPath" -Level "SUCCESS"
+    }
+    else {
+        Write-Log "Telechargement du binaire CShip pre-compile..." -Level "INFO"
+        Invoke-WithDryRun "Download CShip binary for Windows" {
+            $installDir = "$env:USERPROFILE\.local\bin"
+            if (-not (Test-Path $installDir)) {
+                New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+            }
+            $cshipUrl = "https://github.com/stephenleo/cship/releases/latest/download/cship-x86_64-pc-windows-msvc.exe"
+            try {
+                Invoke-WebRequest -Uri $cshipUrl -OutFile $cshipWinPath -UseBasicParsing
+                Write-Log "CShip telecharge: $cshipWinPath" -Level "SUCCESS"
+            }
+            catch {
+                Write-Log "Echec du telechargement CShip: $_" -Level "WARN"
+                Write-Log "Installation manuelle: irm https://cship.dev/install.ps1 | iex" -Level "INFO"
+            }
+        }
+    }
+
+    # ---- jq (requis pour les modules custom CShip) ----
+    Write-Log "Verification de jq..." -Level "INFO"
+    $jqAvailable = Get-Command jq -ErrorAction SilentlyContinue
+    if ($jqAvailable) {
+        Write-Log "jq deja installe" -Level "SUCCESS"
+    }
+    else {
+        Invoke-WithDryRun "Install jq via winget" {
+            try {
+                winget install --id jqlang.jq --accept-source-agreements --accept-package-agreements --silent 2>$null
+                Write-Log "jq installe via winget" -Level "SUCCESS"
+            }
+            catch {
+                Write-Log "Installation jq echouee (non-critique): $_" -Level "WARN"
+            }
+        }
+    }
+
+    # ---- WSL2 : CShip binary ----
+    Write-Log "Installation de CShip dans WSL2..." -Level "INFO"
+
+    Invoke-WithDryRun "Install CShip in WSL2" {
+        $wslCheckCmd = 'command -v cship >/dev/null 2>&1 && file $(which cship) | grep -q ELF && echo "REAL_BINARY" || echo "NEEDS_INSTALL"'
+        $wslResult = (wsl -d $Config.WSLDistro -- bash -c $wslCheckCmd 2>$null | Out-String).Trim()
+
+        if ($wslResult -eq "REAL_BINARY" -and -not $ForceReinstall) {
+            Write-Log "CShip (binaire ELF) deja installe dans WSL2" -Level "SUCCESS"
+        }
+        else {
+            $installCmd = @'
+mkdir -p ~/.local/bin
+CSHIP_URL="https://github.com/stephenleo/cship/releases/latest/download/cship-x86_64-unknown-linux-musl"
+curl -fsSL "$CSHIP_URL" -o ~/.local/bin/cship 2>/dev/null
+chmod +x ~/.local/bin/cship
+# Replace symlink if it points to bash script
+if [ -L /usr/local/bin/cship ]; then
+    sudo rm -f /usr/local/bin/cship
+    sudo ln -s ~/.local/bin/cship /usr/local/bin/cship
+elif [ ! -f /usr/local/bin/cship ]; then
+    sudo ln -s ~/.local/bin/cship /usr/local/bin/cship
+fi
+# Verify
+if ~/.local/bin/cship --help >/dev/null 2>&1; then
+    echo "CShip installed OK"
+else
+    echo "CShip install FAILED"
+fi
+'@
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            Set-Content -Path $tempFile -Value $installCmd -Encoding UTF8 -NoNewline
+            $wslTempPath = ($tempFile -replace '\\', '/' -replace '^(\w):', '/mnt/$1'.ToLower())
+            wsl -d $Config.WSLDistro -- bash $wslTempPath
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            Write-Log "CShip installe dans WSL2" -Level "SUCCESS"
+        }
+    }
+
+    # ---- CShip config (cship.toml) ----
+    Write-Log "Deploiement de la configuration CShip..." -Level "INFO"
+
+    # Config pour Windows
+    $cshipConfigWin = "$env:USERPROFILE\.config\cship.toml"
+    if ((Test-Path $cshipConfigWin) -and -not $ForceReinstall) {
+        Write-Log "Config CShip Windows deja presente: $cshipConfigWin" -Level "SUCCESS"
+    }
+    else {
+        Invoke-WithDryRun "Deploy CShip config (Windows)" {
+            $configDir = "$env:USERPROFILE\.config"
+            if (-not (Test-Path $configDir)) {
+                New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+            }
+            $cshipToml = @'
+# CShip + ATLAS Plugin — Layout v5 (SOTA CC 2.1.85 / Opus 4.6 1M)
+# Row 1: model + dir + git + worktree + session
+# Row 2: context bar + lines + rate limits
+# Row 3: alert (conditional: context >75%)
+
+[cship]
+lines = [
+  "$cship.model  $directory  $git_branch $git_status  $cship.worktree  $cship.session",
+  "$cship.context_bar  $cship.cost.total_lines_added $cship.cost.total_lines_removed  $cship.usage_limits",
+]
+
+[cship.model]
+symbol = "🟣 "
+style = "bold"
+
+[cship.context_bar]
+width = 20
+style = "green"
+warn_threshold = 50
+warn_style = "yellow"
+critical_threshold = 75
+critical_style = "bold red"
+
+[cship.cost.total_lines_added]
+symbol = "+"
+style = "green"
+
+[cship.cost.total_lines_removed]
+symbol = "-"
+style = "red"
+
+[cship.worktree]
+symbol = "🌳 "
+style = "bold green"
+
+[cship.session]
+symbol = "📋 "
+style = "bold blue"
+
+[cship.usage_limits]
+style = "dim"
+'@
+            Set-Content -Path $cshipConfigWin -Value $cshipToml -Encoding UTF8
+            Write-Log "Config CShip deployee: $cshipConfigWin" -Level "SUCCESS"
+        }
+    }
+
+    # Config pour WSL2 (deployer aussi)
+    Invoke-WithDryRun "Deploy CShip config to WSL2" {
+        $wslConfigCheck = 'test -f ~/.config/cship.toml && echo "EXISTS" || echo "MISSING"'
+        $wslConfigResult = (wsl -d $Config.WSLDistro -- bash -c $wslConfigCheck 2>$null | Out-String).Trim()
+
+        if ($wslConfigResult -eq "EXISTS" -and -not $ForceReinstall) {
+            Write-Log "Config CShip WSL2 deja presente" -Level "SUCCESS"
+        }
+        else {
+            $wslSrc = ($cshipConfigWin -replace '\\', '/' -replace '^(\w):', '/mnt/$1'.ToLower())
+            $cmd = "mkdir -p ~/.config && cp '$wslSrc' ~/.config/cship.toml 2>/dev/null && echo 'CShip config copied to WSL2'"
+            wsl -d $Config.WSLDistro -- bash -c $cmd
+        }
+    }
+
+    # ---- settings.json : wire statusLine ----
+    Write-Log "Configuration de la status line dans settings.json..." -Level "INFO"
+
+    $userSettingsPath = Join-Path $Config.UserSettingsDir "settings.json"
+    if (Test-Path $userSettingsPath) {
+        $settingsContent = Get-Content $userSettingsPath -Raw -Encoding UTF8
+        if ($settingsContent -match '"statusLine"') {
+            Write-Log "statusLine deja configure dans settings.json" -Level "SUCCESS"
+        }
+        else {
+            Invoke-WithDryRun "Add statusLine to user settings.json" {
+                try {
+                    $settings = $settingsContent | ConvertFrom-Json
+                    $settings | Add-Member -NotePropertyName "statusLine" -NotePropertyValue @{
+                        type    = "command"
+                        command = "cship"
+                    } -Force
+                    $settings | ConvertTo-Json -Depth 10 | Set-Content $userSettingsPath -Encoding UTF8
+                    Write-Log "statusLine ajoute a settings.json" -Level "SUCCESS"
+                }
+                catch {
+                    Write-Log "Impossible de modifier settings.json: $_" -Level "WARN"
+                }
+            }
+        }
+    }
+    else {
+        Invoke-WithDryRun "Create settings.json with statusLine" {
+            $newSettings = @{
+                statusLine = @{
+                    type    = "command"
+                    command = "cship"
+                }
+            }
+            $settingsDir = Split-Path $userSettingsPath -Parent
+            if (-not (Test-Path $settingsDir)) {
+                New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+            }
+            $newSettings | ConvertTo-Json -Depth 10 | Set-Content $userSettingsPath -Encoding UTF8
+            Write-Log "settings.json cree avec statusLine" -Level "SUCCESS"
+        }
+    }
+
+    # ---- WSL2 settings.json aussi ----
+    Invoke-WithDryRun "Configure statusLine in WSL2 settings.json" {
+        $wslSettingsCmd = @'
+SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$SETTINGS" ]; then
+    if grep -q '"statusLine"' "$SETTINGS" 2>/dev/null; then
+        echo "statusLine already configured in WSL2"
+    else
+        python3 -c "
+import json
+with open('$SETTINGS', 'r') as f:
+    s = json.load(f)
+s['statusLine'] = {'type': 'command', 'command': 'cship'}
+with open('$SETTINGS', 'w') as f:
+    json.dump(s, f, indent=2)
+print('statusLine added to WSL2 settings.json')
+" 2>/dev/null || echo "Could not modify WSL2 settings.json"
+    fi
+else
+    mkdir -p ~/.claude
+    echo '{"statusLine":{"type":"command","command":"cship"}}' > "$SETTINGS"
+    echo "WSL2 settings.json created with statusLine"
+fi
+'@
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        Set-Content -Path $tempFile -Value $wslSettingsCmd -Encoding UTF8 -NoNewline
+        $wslTempPath = ($tempFile -replace '\\', '/' -replace '^(\w):', '/mnt/$1'.ToLower())
+        wsl -d $Config.WSLDistro -- bash $wslTempPath
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Log "CShip status line configuree avec succes!" -Level "SUCCESS"
+    Write-Log "Redemarrez Claude Code pour voir la status line enrichie" -Level "INFO"
+
+    return $true
+}
+
+# ============================================================================
+# ETAPE 10 : MISE A JOUR AUTOMATIQUE (tache planifiee)
 # ============================================================================
 
 function Step-AutoUpdate {
     Write-Log "" -Level "STEP"
     Write-Log "=" * 70 -Level "STEP"
-    Write-Log "ETAPE 9 : Configuration de la mise a jour automatique" -Level "STEP"
+    Write-Log "ETAPE 10 : Configuration de la mise a jour automatique" -Level "STEP"
     Write-Log "=" * 70 -Level "STEP"
 
     # Creer le script de mise a jour
@@ -1381,13 +2034,13 @@ catch {
 }
 
 # ============================================================================
-# ETAPE 10 : VALIDATION FINALE
+# ETAPE 11 : VALIDATION FINALE
 # ============================================================================
 
 function Step-Validation {
     Write-Log "" -Level "STEP"
     Write-Log "=" * 70 -Level "STEP"
-    Write-Log "ETAPE 10 : Validation de l'installation" -Level "STEP"
+    Write-Log "ETAPE 11 : Validation de l'installation" -Level "STEP"
     Write-Log "=" * 70 -Level "STEP"
 
     $results = @()
@@ -1470,6 +2123,21 @@ function Step-Validation {
         Version    = if ($taskOK) { $Config.UpdateSchedule } else { "-" }
     }
 
+    # 8. CShip Status Line
+    $cshipWin = Test-Path "$env:USERPROFILE\.local\bin\cship.exe"
+    $cshipWSL = $false
+    try {
+        $cshipCheck = (wsl -d $Config.WSLDistro -- bash -c "command -v cship >/dev/null 2>&1 && file \$(which cship) | grep -q ELF && echo OK" 2>$null | Out-String).Trim()
+        $cshipWSL = $cshipCheck -eq "OK"
+    }
+    catch { }
+    $cshipOK = $cshipWin -or $cshipWSL
+    $results += [PSCustomObject]@{
+        Composante = "CShip Status Line"
+        Statut     = if ($cshipOK) { "OK" } else { "NON INSTALLE" }
+        Version    = if ($cshipWin -and $cshipWSL) { "Win + WSL2" } elseif ($cshipWin) { "Win only" } elseif ($cshipWSL) { "WSL2 only" } else { "-" }
+    }
+
     # Afficher le rapport
     Write-Log "" -Level "STEP"
     Write-Log "RAPPORT DE VALIDATION" -Level "STEP"
@@ -1520,15 +2188,28 @@ function Step-Validation {
 # EXECUTION PRINCIPALE
 # ============================================================================
 
+# ---- Afficher le menu interactif (TOUJOURS) ----
+$menuResult = Show-DeploymentMenu -PreSelected $Profile
+$SelectedProfile = $menuResult.Profile
+if ($menuResult.DryRun) { $DryRun = $true }
+
+# Custom: demander quelles etapes
+$customStepNums = @()
+if ($SelectedProfile -eq "Custom") {
+    $customStepNums = Show-CustomStepMenu
+}
+
+Write-Host ""
 $banner = @"
 
   ====================================================================
      DEPLOIEMENT CLAUDE CODE & COWORK - G Mining Services (CAGM)
   ====================================================================
-     Script  : Deploy-ClaudeCode.ps1 v3.0.0
+     Script  : Deploy-ClaudeCode.ps1 v4.0.0
      Date    : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
      Poste   : $env:COMPUTERNAME
-     User    : $env:USERNAME
+     User    : $env:USERNAME ($WSLUser dans WSL)
+     Profil  : $SelectedProfile
      Mode    : $(if ($DryRun) { "SIMULATION (Dry Run)" } else { "PRODUCTION" })
   ====================================================================
 
@@ -1537,10 +2218,11 @@ $banner = @"
 Write-Host $banner -ForegroundColor Cyan
 
 # Initialiser le log
-Write-Log "Debut du deploiement - $env:COMPUTERNAME / $env:USERNAME"
+Write-Log "Debut du deploiement - $env:COMPUTERNAME / $env:USERNAME / Profil: $SelectedProfile"
 if ($DryRun) { Write-Log "MODE DRY RUN ACTIVE - Aucune modification ne sera apportee" -Level "WARN" }
 if ($ForceReinstall) { Write-Log "MODE FORCE REINSTALLATION active" -Level "WARN" }
 if ($ProxyUrl) { Write-Log "Proxy configure: $ProxyUrl" -Level "INFO" }
+if ($GithubToken) { Write-Log "GITHUB_TOKEN disponible (ATLAS marketplace)" -Level "SUCCESS" }
 
 # Inventaire pre-deploiement
 Write-PreFlightInventory
@@ -1551,27 +2233,46 @@ if ($resumeStep -gt 0) {
     Write-Log "REPRISE apres reboot - Les $resumeStep premieres etapes seront ignorees" -Level "WARN"
 }
 
-# Executer les etapes
-# AdminRequired: $true = necessite droits admin (managed-settings, features, scheduled task)
-#                $false = fonctionne en user normal (CLI, extensions, bashrc, plugins)
-#                $null = toujours executer (prerequis, validation)
-$steps = @(
-    @{ Name = "Prerequis";               Func = { Step-Prerequisites };     AdminRequired = $null }
-    @{ Name = "WSL2";                     Func = { Step-WSL2Setup };         AdminRequired = $true }
-    @{ Name = "Claude Code (WSL2)";       Func = { Step-ClaudeCodeWSL };     AdminRequired = $false }
-    @{ Name = "Claude Code (Windows)";    Func = { Step-ClaudeCodeWindows }; AdminRequired = $false }
-    @{ Name = "Claude Desktop (Cowork)";  Func = { Step-ClaudeDesktop };     AdminRequired = $false }
-    @{ Name = "Extensions VS Code";       Func = { Step-VSCodeExtensions };  AdminRequired = $false }
-    @{ Name = "Configuration centralisee"; Func = { Step-ManagedSettings };  AdminRequired = $true }
-    @{ Name = "Plugin";                   Func = { Step-DeployPlugin };      AdminRequired = $false }
-    @{ Name = "Autocompletion shell";     Func = { Step-ShellCompletion };   AdminRequired = $false }
-    @{ Name = "Mise a jour automatique";  Func = { Step-AutoUpdate };        AdminRequired = $true }
-    @{ Name = "Validation";               Func = { Step-Validation };        AdminRequired = $null }
+# ---- Construire le pipeline d'etapes selon le profil ----
+# Chaque etape a un StepNum unique pour le filtrage par profil
+$allSteps = @(
+    @{ StepNum = 0;  Name = "Prerequis";                Func = { Step-Prerequisites } }
+    @{ StepNum = 1;  Name = "WSL2";                     Func = { Step-WSL2Setup } }
+    @{ StepNum = 2;  Name = "Claude Code (WSL2)";       Func = { Step-ClaudeCodeWSL } }
+    @{ StepNum = 3;  Name = "Claude Code (Windows)";    Func = { Step-ClaudeCodeWindows } }
+    @{ StepNum = 4;  Name = "Claude Desktop (Cowork)";  Func = { Step-ClaudeDesktop } }
+    @{ StepNum = 5;  Name = "Extensions VS Code";       Func = { Step-VSCodeExtensions } }
+    @{ StepNum = 6;  Name = "Configuration centralisee"; Func = { Step-ManagedSettings } }
+    @{ StepNum = 7;  Name = "Plugin GMS";               Func = { Step-DeployPlugin } }
+    @{ StepNum = 8;  Name = "Plugin ATLAS";             Func = { Step-PluginATLAS } }
+    @{ StepNum = 9;  Name = "Autocompletion shell";     Func = { Step-ShellCompletion } }
+    @{ StepNum = 10; Name = "CShip Status Line";        Func = { Step-CShipStatusLine } }
+    @{ StepNum = 13; Name = "Windows Terminal + ATLAS";  Func = { Step-WindowsTerminal } }
+    @{ StepNum = 11; Name = "Mise a jour automatique";  Func = { Step-AutoUpdate } }
+    @{ StepNum = 12; Name = "Validation";               Func = { Step-Validation } }
 )
 
-if ($AdminOnly) {
-    Write-Log "MODE ADMIN ONLY - Seules les etapes admin seront executees" -Level "WARN"
+# Determiner les etapes actives selon le profil
+if ($SelectedProfile -eq "Custom") {
+    $activeStepNums = $customStepNums
 }
+elseif ($ProfileStepMap.ContainsKey($SelectedProfile)) {
+    $activeStepNums = $ProfileStepMap[$SelectedProfile]
+}
+else {
+    # Fallback: Standard
+    $activeStepNums = $ProfileStepMap["Standard"]
+}
+
+$steps = $allSteps | Where-Object { $activeStepNums -contains $_.StepNum }
+
+# Afficher le plan d'execution
+Write-Log "" -Level "INFO"
+Write-Log "Plan d'execution ($SelectedProfile):" -Level "STEP"
+foreach ($s in $steps) {
+    Write-Log "  [$($s.StepNum)] $($s.Name)" -Level "INFO"
+}
+Write-Log "" -Level "INFO"
 
 $startTime = Get-Date
 
@@ -1580,17 +2281,7 @@ for ($stepIndex = 0; $stepIndex -lt $steps.Count; $stepIndex++) {
 
     # Sauter les etapes deja completees (resume apres reboot)
     if ($stepIndex -lt $resumeStep) {
-        Write-Log "SKIP etape $stepIndex '$($step.Name)' (deja completee avant reboot)" -Level "INFO"
-        continue
-    }
-
-    # Mode hybride: filtrer selon AdminOnly
-    if ($AdminOnly -and $step.AdminRequired -eq $false) {
-        Write-Log "SKIP '$($step.Name)' (mode -AdminOnly, etape user-space)" -Level "INFO"
-        continue
-    }
-    if (-not $AdminOnly -and $step.AdminRequired -eq $true) {
-        Write-Log "SKIP '$($step.Name)' (pas admin, etape admin-only)" -Level "INFO"
+        Write-Log "SKIP etape $($step.StepNum) '$($step.Name)' (deja completee avant reboot)" -Level "INFO"
         continue
     }
 
@@ -1634,11 +2325,37 @@ Write-Log "DEPLOIEMENT TERMINE en $($duration.Minutes)m $($duration.Seconds)s" -
 Write-Log "=" * 70 -Level "STEP"
 Write-Log "Log complet: $($Config.LogFile)" -Level "INFO"
 Write-Log "" -Level "STEP"
-Write-Log "PROCHAINES ETAPES :" -Level "STEP"
-Write-Log "  1. Ouvrez VS Code et lancez Claude Code (Ctrl+Shift+P > Claude Code)" -Level "INFO"
-Write-Log "  2. Authentifiez-vous via OAuth (SSO Microsoft gmining.com)" -Level "INFO"
-Write-Log "  3. Dans le terminal WSL, tapez 'claude' pour la premiere connexion" -Level "INFO"
-Write-Log "  4. Ouvrez Claude Desktop pour acceder a Cowork" -Level "INFO"
+Write-Log "PROCHAINES ETAPES ($SelectedProfile) :" -Level "STEP"
+
+switch ($SelectedProfile) {
+    "Standard" {
+        Write-Log "  1. Ouvrez Claude Desktop depuis le menu Demarrer" -Level "INFO"
+        Write-Log "  2. Authentifiez-vous via OAuth (SSO Microsoft gmining.com)" -Level "INFO"
+        Write-Log "  3. Activez Cowork : Preferences > Cowork > Activer" -Level "INFO"
+        Write-Log "  4. Utilisez le plugin GMS pour vos projets d'ingenierie" -Level "INFO"
+    }
+    "Developer" {
+        Write-Log "  1. Ouvrez VS Code et lancez Claude Code (Ctrl+Shift+P > Claude Code)" -Level "INFO"
+        Write-Log "  2. Authentifiez-vous via OAuth (SSO Microsoft gmining.com)" -Level "INFO"
+        Write-Log "  3. Dans le terminal WSL: claude        # Premiere connexion CLI" -Level "INFO"
+        Write-Log "  4. Testez ATLAS: /atlas doctor          # Diagnostic plugin" -Level "INFO"
+        Write-Log "  5. Ouvrez Claude Desktop pour Cowork" -Level "INFO"
+        Write-Log "" -Level "INFO"
+        Write-Log "  Raccourcis VS Code:" -Level "INFO"
+        Write-Log "    Ctrl+Shift+Alt+C  -> Claude Code dans WSL" -Level "INFO"
+        Write-Log "    Ctrl+Shift+Alt+W  -> Ouvrir WSL Remote" -Level "INFO"
+    }
+    "Admin" {
+        Write-Log "  1. Le poste est prepare pour les utilisateurs" -Level "INFO"
+        Write-Log "  2. L'utilisateur devra installer CC/Desktop au premier login" -Level "INFO"
+        Write-Log "  3. managed-settings.json appliquera les politiques automatiquement" -Level "INFO"
+    }
+    default {
+        Write-Log "  1. Ouvrez Claude Desktop ou tapez 'claude' dans un terminal" -Level "INFO"
+        Write-Log "  2. Authentifiez-vous via OAuth (SSO Microsoft gmining.com)" -Level "INFO"
+    }
+}
+
 Write-Log "" -Level "STEP"
 Write-Log "VERIFICATION RAPIDE :" -Level "STEP"
 Write-Log "  claude --version          # Version installee" -Level "INFO"
