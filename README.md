@@ -56,9 +56,11 @@ Built for **G Mining Services (CAGM)** engineering workstations. Designed to be 
 | 10 | CShip status line (binary + config) | | ✅ | |
 | 11 | Auto-update scheduled task | ✅ | ✅ | ✅ |
 | 12 | Validation report (JSON) | ✅ | ✅ | ✅ |
+| 13 | Windows Terminal (ATLAS profile + shortcut) | | ✅ | |
 
 ## Features
 
+- **Auto-elevation UAC**: Automatically prompts for admin rights when needed
 - **Interactive menu**: Always displayed, profiles pre-selectable via `-Profile`
 - **Resume after reboot**: WSL2 activation auto-resumes via RunOnce registry
 - **Dry run mode**: Full simulation without making changes
